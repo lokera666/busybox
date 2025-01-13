@@ -5,12 +5,20 @@ on:
   push:
     branches:
       - master
+  workflow_dispatch:
   schedule:
     - cron: 0 0 * * 0
 
 defaults:
   run:
     shell: 'bash -Eeuo pipefail -x {0}'
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
 
@@ -20,24 +28,30 @@ jobs:
     outputs:
       strategy: ${{ steps.generate-jobs.outputs.strategy }}
     steps:
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
+      - uses: docker-library/bashbrew@HEAD
       - id: generate-jobs
         name: Generate Jobs
         run: |
-          git clone --depth 1 https://github.com/docker-library/bashbrew.git -b master ~/bashbrew
-          strategy="$(GENERATE_STACKBREW_LIBRARY='.github/workflows/fake-gsl.sh' ~/bashbrew/scripts/github-actions/generate.sh)"
+          strategy="$(GENERATE_STACKBREW_LIBRARY='.github/workflows/fake-gsl.sh' "$BASHBREW_SCRIPTS/github-actions/generate.sh")"
           strategy="$(.github/workflows/munge-build.sh -c <<<"$strategy")"
-          strategy="$(.github/workflows/munge-debian-unstable.sh -c <<<"$strategy")"
-          jq . <<<"$strategy" # sanity check / debugging aid
-          echo "::set-output name=strategy::$strategy"
+          strategy="$(.github/workflows/munge-unstable.sh -c <<<"$strategy")"
+
+          EOF="EOF-$RANDOM-$RANDOM-$RANDOM"
+          echo "strategy<<$EOF" >> "$GITHUB_OUTPUT"
+          jq <<<"$strategy" . | tee -a "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
 
   test:
     needs: generate-jobs
     strategy: ${{ fromJson(needs.generate-jobs.outputs.strategy) }}
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    env:
+      BASHBREW_ARCH: amd64 # TODO consider using "$BASHBREW_SCRIPTS/bashbrew-host-arch.sh" ? (would make it harder to force i386 in our matrix too, so explicit is probably better)
     steps:
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
+      - uses: docker-library/bashbrew@HEAD # build.sh needs bashbrew
       - name: Prepare Environment
         run: ${{ matrix.runs.prepare }}
       - name: Pull Dependencies
@@ -50,3 +64,11 @@ jobs:
         run: ${{ matrix.runs.test }}
       - name: '"docker images"'
         run: ${{ matrix.runs.images }}
+      - name: Git Diff # see "munge-build.sh"
+        run: |
+          if git diff --exit-code */*/Dockerfile.builder; then # see "hack-unstable.sh" (and "munge-unstable.sh")
+            git diff --exit-code
+          else
+            # for unstable builds, let's leave this in but purely informational (instead of causing CI to fail)
+            git diff
+          fi

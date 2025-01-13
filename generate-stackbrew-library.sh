@@ -34,6 +34,8 @@ Maintainers: Tianon Gravi <admwiggin@gmail.com> (@tianon),
              Joseph Ferguson <yosifkit@gmail.com> (@yosifkit)
 GitRepo: $gitHubUrl.git
 GitCommit: $selfCommit
+Builder: oci-import
+File: index.json
 EOH
 for arch in "${arches[@]}"; do
 	commit="${archCommits[$arch]}"
@@ -51,8 +53,7 @@ join() {
 	echo "${out#$sep}"
 }
 
-# if stable is 1.32.1 and unstable is 1.33.0, we want busybox:1.33 to point to unstable but busybox:1 (and busybox:latest) to point to stable
-# since stable always comes first, we'll just let it take all the tags it calculates, and use this to remove any overlap when we process unstable :)
+# make sure generic tags like "latest", "1", etc only get used once
 declare -A usedTags=()
 _tags() {
 	local tag first=
@@ -75,7 +76,6 @@ _tags() {
 	return 0
 }
 
-allVersions=()
 for version; do
 	export version
 
@@ -83,12 +83,7 @@ for version; do
 	eval "variants=( $variants )"
 
 	fullVersion="$(jq -r '.[env.version].version' versions.json)"
-	allVersions+=( "$fullVersion" )
-	latestVersion="$(xargs -n1 <<<"${allVersions[*]}" | sort -V | tail -1)"
-	if [ "$latestVersion" != "$fullVersion" ]; then
-		# if "unstable" is older than "stable" (1.32.0 unstable vs 1.32.1 stable, for example), skip unstable
-		continue
-	fi
+	stability="$(jq -r '.[env.version].stability' versions.json)"
 
 	versionAliases=()
 	while [ "${fullVersion%.*}" != "$fullVersion" ]; do
@@ -97,10 +92,14 @@ for version; do
 	done
 	versionAliases+=(
 		$fullVersion
-		$version # "stable", "unstable"
-		latest
 	)
+	if [ "$version" = 'latest' ] || [ "$stability" != 'unstable' ]; then
+		# if we have version 1.36.0 labelled as "unstable" and then 1.36.1 is released, we don't want to mark "1.35.0" as the "latest unstable" because that's not true, so only the latest latest latest release can be "unstable"
+		versionAliases+=( $stability )
+	fi
+	versionAliases+=( latest )
 
+	actualArches=()
 	declare -A archLatestDir=()
 	for variant in "${variants[@]}"; do
 		dir="$version/$variant"
@@ -111,25 +110,33 @@ for version; do
 		variantArches=()
 		for arch in "${arches[@]}"; do
 			archCommit="${archCommits[$arch]}"
-			if wget --quiet --spider -O /dev/null -o /dev/null "$rawGitUrl/$archCommit/$dir/busybox.tar.xz"; then
+			if wget --quiet --spider -O /dev/null -o /dev/null "$rawGitUrl/$archCommit/$dir/$arch/rootfs.tar.gz"; then
 				variantArches+=( "$arch" )
-				: "${archLatestDir[$arch]:=$dir}" # record the first supported directory per architecture for "latest" and friends
+				if [ "$arch" = 'riscv64' ] && [ "$variant" = 'glibc' ]; then
+					: # do not let "glibc" be "latest" on riscv64 until it is no longer based on Debian Unstable
+				elif [ -z "${archLatestDir[$arch]:-}" ]; then
+					# record the first supported directory per architecture for "latest" and friends
+					archLatestDir["$arch"]="$dir/$arch"
+					actualArches+=( "$arch" )
+				fi
 			fi
 		done
 
-		if _tags "${variantAliases[@]}"; then
+		if [ "${#variantArches[@]}" -gt 0 ] && _tags "${variantAliases[@]}"; then
 			cat <<-EOE
 				Architectures: $(join ', ' "${variantArches[@]}")
-				Directory: $dir
 			EOE
+			for arch in "${variantArches[@]}"; do
+				echo "$arch-Directory: $dir/$arch"
+			done
 		fi
 	done
 
-	if _tags "${versionAliases[@]}"; then
+	if [ "${#actualArches[@]}" -gt 0 ] && _tags "${versionAliases[@]}"; then
 		cat <<-EOE
-			Architectures: $(join ', ' "${arches[@]}")
+			Architectures: $(join ', ' "${actualArches[@]}")
 		EOE
-		for arch in "${arches[@]}"; do
+		for arch in "${actualArches[@]}"; do
 			archDir="${archLatestDir[$arch]}"
 			cat <<-EOA
 				${arch}-Directory: $archDir
